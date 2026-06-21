@@ -5,10 +5,9 @@ It lets your Hermes agent send and receive **NIP-17 end-to-end-encrypted private
 direct messages** — talk to your agent from any Nostr client (Damus, Amethyst,
 Snort, …), and have cron jobs and notifications delivered to you as DMs.
 
-This is a **standalone, installable plugin** — it requires **zero changes to
-Hermes core**. It registers itself through the platform registry
-(`hermes_agent.plugins` entry point), the same mechanism every gateway channel
-uses.
+This is a **standalone, drop-in plugin** — it requires **zero changes to
+Hermes core**. It registers itself through Hermes's platform registry
+(`register()`), the same mechanism every gateway channel uses.
 
 ## Features
 
@@ -39,43 +38,25 @@ uses.
 
 ## Installation
 
-> **Heads-up:** the `hermes plugins enable` / `hermes plugins list` commands
-> currently only see plugins installed as a **directory** under
-> `~/.hermes/plugins/`, not pip entry-point packages. So the **drop-in** install
-> is the smoothest path — the standard `hermes plugins` commands work with it.
-
-### Option A — drop-in directory (recommended; works with `hermes plugins`)
+Install as a drop-in directory under your Hermes plugins folder:
 
 ```bash
 git clone https://github.com/unsaltedbutter-ai/hermes-nostr.git
 cp -r hermes-nostr/hermes_nostr ~/.hermes/plugins/nostr
-# deps aren't auto-installed for drop-ins — add nostr-sdk to Hermes's env
-# (use the interpreter Hermes runs on, e.g. ~/.hermes/hermes-agent/venv):
+# install the one runtime dependency into the interpreter Hermes runs on
+# (e.g. ~/.hermes/hermes-agent/venv):
 python -m pip install 'nostr-sdk>=0.44.2,<0.45'
 ```
 
-### Option B — pip (distributable)
-
-```bash
-pip install hermes-nostr            # into the same environment as Hermes
-```
-
-Discovered via the `hermes_agent.plugins` entry point on next startup.
-**Caveat:** until the upstream CLI learns about entry-point plugins,
-`hermes plugins enable/list` won't see it — enable it by adding `nostr` to
-`plugins.enabled` in `~/.hermes/config.yaml` (see below) rather than via the
-command.
-
 ## Enable it
 
-Like every non-bundled plugin, it is **opt-in**. For the drop-in install:
+Like every non-bundled plugin, it is **opt-in**:
 
 ```bash
 hermes plugins enable nostr
 ```
 
-…or directly in `~/.hermes/config.yaml` (the only route for the pip install,
-per the caveat above):
+…or add it to `~/.hermes/config.yaml`:
 
 ```yaml
 plugins:
