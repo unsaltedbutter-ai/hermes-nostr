@@ -143,9 +143,12 @@ The `Platform("nostr")` enum member is minted dynamically by Hermes's enum
 
 ## Development
 
+Run the tests inside a Hermes-enabled environment (the host provides
+`gateway.*`), with `nostr-sdk` and `pytest` installed:
+
 ```bash
-pip install -e '.[dev]'     # into a Hermes-enabled environment
-pytest -q
+pip install pytest
+PYTHONPATH=. pytest -q
 ```
 
 The tests exercise the plugin contract (register → valid entry → factory builds
