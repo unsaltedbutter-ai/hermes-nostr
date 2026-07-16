@@ -365,7 +365,7 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Deferred validation: __init__ is lenient (so the plugin registry and
         # env-only setups can construct the adapter); connect() is where missing
         # prerequisites become a clean, non-retryable failure.

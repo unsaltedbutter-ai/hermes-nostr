@@ -1,7 +1,7 @@
 name: nostr
 label: Nostr
 kind: platform
-version: 1.0.0
+version: 1.0.1
 description: >
   Nostr gateway adapter for Hermes Agent. Connects over NIP-17 end-to-end
   encrypted private direct messages (gift wraps) built on nostr-sdk. Publishes
