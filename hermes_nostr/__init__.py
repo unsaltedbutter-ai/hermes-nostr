@@ -8,4 +8,4 @@ drop-in, or a bundled scan).
 from .adapter import NostrAdapter, register
 
 __all__ = ["register", "NostrAdapter"]
-__version__ = "0.1.0"
+__version__ = "2.0.0"

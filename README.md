@@ -31,10 +31,16 @@ Hermes core**. It registers itself through Hermes's platform registry
 
 - A working **Hermes Agent** install (this plugin runs inside it).
 - **Python ≥ 3.10**.
-- **[`nostr-sdk`](https://pypi.org/project/nostr-sdk/) ≥ 0.44, < 0.45** — a
+- **[`nostr-sdk`](https://pypi.org/project/nostr-sdk/) ≥ 0.45.0a7, < 0.46** — a
   Rust/PyO3 binding distributed as **wheels only** (no source build). Installed
   automatically with this package. Platforms without a wheel (e.g. Termux/
   Android) are unsupported.
+
+  0.45 is required: it is the release that lets a NIP-40 expiration be set on
+  the *outside* of a gift wrap, which is the only place a relay can see it.
+  **Upgrading an existing install?** 0.44 is not compatible, and on 0.44 this
+  adapter degrades to disabled rather than erroring — the interactive setup
+  detects that case and upgrades for you.
 
 ## Installation
 
@@ -45,7 +51,7 @@ git clone https://github.com/unsaltedbutter-ai/hermes-nostr.git
 cp -r hermes-nostr/hermes_nostr ~/.hermes/plugins/nostr
 # install the one runtime dependency into the interpreter Hermes runs on
 # (e.g. ~/.hermes/hermes-agent/venv):
-python -m pip install 'nostr-sdk>=0.44.2,<0.45'
+python -m pip install 'nostr-sdk>=0.45.0a7,<0.46'
 ```
 
 ## Enable it

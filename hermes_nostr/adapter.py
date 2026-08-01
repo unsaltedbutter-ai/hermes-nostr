@@ -1,8 +1,8 @@
 """
 Nostr platform adapter (NIP-17 private DMs) built on nostr-sdk.
 
-Inbound:  kind 1059 gift wraps → UnwrappedGift.from_gift_wrap → handle_message()
-Outbound: send() → Client.send_private_msg() (handles seal/wrap/publish)
+Inbound:  kind 1059 gift wraps → UnwrappedGift.from_gift_wrap_async → handle_message()
+Outbound: send() → build rumor + gift wrap → Client.send_event()
 
 Also publishes Kind 0 profile metadata and a Kind 10050 NIP-17 DM inbox list
 on connect so compliant senders know where to reach the bot.
@@ -28,6 +28,7 @@ Optional env vars:
 import asyncio
 import json
 import logging
+import secrets
 import os
 import re
 import time
@@ -38,25 +39,25 @@ from urllib.parse import urlparse
 try:
     from nostr_sdk import (
         Client,
+        ClientNotification,
         EventBuilder,
         Filter,
-        HandleNotification,
         Keys,
         Kind,
         KindStandard,
         Metadata,
-        NostrSigner,
         PublicKey,
         RelayStatus,
         RelayUrl,
+        ReqTarget,
         Tag,
         Timestamp,
         UnwrappedGift,
+        nip59_make_gift_wrap_async,
     )
     _NOSTR_SDK_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _NOSTR_SDK_AVAILABLE = False
-    HandleNotification = object  # type: ignore[assignment,misc]
 
 from gateway.config import Platform, PlatformConfig
 
@@ -88,6 +89,10 @@ logger = logging.getLogger("gateway.platforms.nostr")
 NIP40_TTL_SECONDS = 7 * 24 * 3600  # 1 week default
 # NIP-59 created_at obfuscation window.
 NIP59_MIN_LOOKBACK_MINUTES = 2880
+NIP59_MAX_BACKDATE_SECONDS = NIP59_MIN_LOOKBACK_MINUTES * 60
+# Cap our own expiration backdating at a quarter of the TTL so a short-lived
+# DM keeps most of its configured lifetime (and is never born already expired).
+_EXPIRATION_BACKDATE_FRACTION = 4
 
 # Watchdog tuning.  The notification loop is a Rust task we can't introspect,
 # so we poll observable health every TICK seconds and bounce the client if
@@ -171,11 +176,38 @@ def is_valid_http_url(value: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+def dm_expiration_tag(ttl_seconds: int) -> "Tag":
+    """Build one NIP-40 tag to stamp on BOTH the rumor and its gift wrap.
+
+    A relay only ever sees the outer gift wrap -- it cannot read the rumor --
+    so an expiration that lives only inside is invisible to it and the wrap is
+    never garbage-collected. Put it only on the wrap and the recipient's client
+    has no idea the message is meant to expire. It goes in both places, and the
+    same tag is used so the two can't disagree.
+
+    The timestamp is anchored to a randomly backdated point rather than to now.
+    A gift wrap's created_at is deliberately randomized into the past, so an
+    absolute `now + ttl` would hand any observer the real send time back as
+    `expiration - ttl` (7 days is this adapter's default and a guessable one),
+    undoing the randomization NIP-59 exists to provide. The backdate is drawn
+    from [0, min(2 days, ttl / 4)], so at least three quarters of the
+    configured TTL survives and the wrap is never born already expired.
+    """
+    max_backdate = min(
+        NIP59_MAX_BACKDATE_SECONDS, ttl_seconds // _EXPIRATION_BACKDATE_FRACTION,
+    )
+    # randbelow(0) raises; a non-positive bound just means "don't backdate".
+    backdate = secrets.randbelow(max_backdate + 1) if max_backdate > 0 else 0
+    return Tag.expiration(
+        Timestamp.from_secs(int(time.time()) - backdate + ttl_seconds)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
 
-class NostrAdapter(BasePlatformAdapter, HandleNotification):
+class NostrAdapter(BasePlatformAdapter):
     """Nostr DM adapter using NIP-17 private direct messages."""
 
     # NB: no class-level ``platform = Platform.NOSTR`` — that would evaluate at
@@ -216,13 +248,16 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
         # gateway/config.py seeds extra/home_channel but not ``token``.
         raw_key = (config.token or os.getenv("NOSTR_PRIVATE_KEY", "") or "").strip()
         self._keys: Optional["Keys"] = None
-        self._signer: Optional["NostrSigner"] = None
+        self._signer: Optional["Keys"] = None
         self._pubkey_hex: str = ""
         self._npub: str = ""
         if raw_key and _NOSTR_SDK_AVAILABLE:
             try:
                 self._keys = Keys.parse(raw_key)
-                self._signer = NostrSigner.keys(self._keys)
+                # nostr-sdk >=0.45: Keys implements the signer traits directly,
+                # so NostrSigner.keys() is gone. Kept as its own attribute so
+                # the signing call sites still read as signing.
+                self._signer = self._keys
                 self._pubkey_hex = self._keys.public_key().to_hex()
                 self._npub = self._keys.public_key().to_bech32()
             except Exception:
@@ -403,7 +438,9 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
             return False
 
         self._load_seen_ids()
-        self._client = Client(self._signer)
+        # nostr-sdk >=0.45: the Client holds no signer; events are signed
+        # before being handed to send_event().
+        self._client = Client()
 
         added = 0
         for url in self._relay_urls:
@@ -446,10 +483,16 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
             .kind(Kind.from_std(KindStandard.GIFT_WRAP))
             .since(since_ts)
         )
-        await self._client.subscribe(f)
+        # Open the notification stream BEFORE subscribing: notifications() only
+        # delivers what arrives after the call, so subscribing first would race
+        # and drop the earliest gift wraps.
+        notifications = self._client.notifications()
+        await self._client.subscribe(ReqTarget.auto([f]))
 
         # Run the event handler loop
-        self._notif_task = asyncio.create_task(self._client.handle_notifications(self))
+        self._notif_task = asyncio.create_task(
+            self._notification_loop(notifications)
+        )
 
         # Supervise the notification loop.  Started after the loop so a
         # never-started loop is never "unhealthy".
@@ -666,25 +709,43 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
             .kind(Kind.from_std(KindStandard.GIFT_WRAP))
             .since(since_ts)
         )
-        await self._client.subscribe(f)
+        notifications = self._client.notifications()
+        await self._client.subscribe(ReqTarget.auto([f]))
         self._notif_task = asyncio.create_task(
-            self._client.handle_notifications(self)
+            self._notification_loop(notifications)
         )
 
     # ------------------------------------------------------------------
-    # nostr-sdk HandleNotification protocol
+    # nostr-sdk notification stream
     # ------------------------------------------------------------------
 
-    async def handle(self, relay_url, subscription_id, event) -> None:
-        """Called by nostr-sdk for every event the subscription delivers."""
-        try:
-            await self._process_event(event, str(relay_url))
-        except Exception:
-            logger.exception("Nostr: error handling event")
+    async def _notification_loop(self, notifications) -> None:
+        """Drain the client notification stream into _process_event.
 
-    async def handle_msg(self, relay_url, msg) -> None:
-        """Required by HandleNotification. EOSE/NOTICE/etc. are not actioned here."""
-        return None
+        Replaces the HandleNotification trait that nostr-sdk dropped in 0.45.
+        Returning (rather than raising) when the stream ends keeps the
+        watchdog's `_notif_task.done()` health check working unchanged: a
+        finished task still reads as an unhealthy loop that needs recovery.
+        """
+        try:
+            while True:
+                notification = await notifications.next()
+                if notification is None:
+                    # Stream terminated (client shut down).
+                    return
+                if not isinstance(notification, ClientNotification.NEW_EVENT):
+                    # MESSAGE (EOSE/NOTICE/...) and SHUTDOWN are not actioned.
+                    continue
+                try:
+                    await self._process_event(
+                        notification.event, str(notification.relay_url),
+                    )
+                except Exception:
+                    logger.exception("Nostr: error handling event")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Nostr: notification loop terminated unexpectedly")
 
     # ------------------------------------------------------------------
     # Inbound: unwrap and dispatch
@@ -704,7 +765,7 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
         logger.info("Nostr: received gift wrap %s from %s", event_id[:16], relay_url)
 
         try:
-            unwrapped = await UnwrappedGift.from_gift_wrap(self._signer, event)
+            unwrapped = await UnwrappedGift.from_gift_wrap_async(self._signer, event)
         except Exception as exc:
             logger.info("Nostr: failed to unwrap event %s: %s", event_id[:16], exc)
             return
@@ -792,8 +853,9 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
         except Exception:
             return SendResult(success=False, error=f"Invalid recipient pubkey: {chat_id}")
 
-        exp_ts = int(time.time()) + self._nip40_ttl_seconds
-        expiration = Tag.expiration(Timestamp.from_secs(exp_ts))
+        # One tag for every chunk of this message, stamped inside each rumor
+        # and on each gift wrap, so all chunks expire together.
+        expiration = dm_expiration_tag(self._nip40_ttl_seconds)
 
         # Long replies are split into multiple DMs. Relays accept large events,
         # but each NIP-17 message is a separate gift wrap and most Nostr clients
@@ -805,7 +867,8 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
         last_message_id: Optional[str] = None
         for chunk in chunks:
             try:
-                output = await self._client.send_private_msg(recipient_pk, chunk, [expiration])
+                wrap = await self._build_gift_wrap(recipient_pk, chunk, expiration)
+                output = await self._client.send_event(wrap)
             except Exception as exc:
                 logger.error("Nostr: failed to send DM: %s", exc)
                 return SendResult(success=False, error=str(exc))
@@ -813,7 +876,8 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
             # NIP-17: also send a copy to ourselves so we can recover sent-message
             # history from any other client we sign in with.
             try:
-                await self._client.send_private_msg(self_pk, chunk, [expiration])
+                self_wrap = await self._build_gift_wrap(self_pk, chunk, expiration)
+                await self._client.send_event(self_wrap)
             except Exception as exc:
                 logger.debug("Nostr: failed to publish self-copy: %s", exc)
 
@@ -828,6 +892,25 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
                     pass
 
         return SendResult(success=True, message_id=last_message_id)
+
+    async def _build_gift_wrap(self, recipient_pk, text: str, exp_tag):
+        """Seal and gift-wrap `text` for `recipient_pk`, carrying `exp_tag`.
+
+        nostr-sdk >=0.45 removed Client.send_private_msg, and its replacement's
+        `expiration=` parameter writes only to the wrap. Building the rumor here
+        lets the same tag go inside and outside -- see dm_expiration_tag.
+        """
+        rumor = (
+            EventBuilder(
+                Kind.from_std(KindStandard.PRIVATE_DIRECT_MESSAGE), text,
+            )
+            .tags([Tag.public_key(recipient_pk), exp_tag])
+            .finalize_unsigned(self._keys.public_key())
+        )
+        return await nip59_make_gift_wrap_async(
+            self._signer, recipient_pk, rumor, expiration=None,
+            extra_tags=[exp_tag],
+        )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Nostr has no typing-indicator protocol; this is a no-op."""
@@ -882,15 +965,24 @@ class NostrAdapter(BasePlatformAdapter, HandleNotification):
         if self._bot_website:
             meta_dict["website"] = self._bot_website
         metadata = Metadata.from_json(json.dumps(meta_dict, ensure_ascii=False))
-        await self._client.set_metadata(metadata)
+        # nostr-sdk >=0.45 dropped Client.set_metadata and EventBuilder's kind
+        # constructors, so kind 0 is built and signed by hand.
+        await self._publish(EventBuilder(Kind(0), metadata.as_json()))
         logger.debug("Nostr: published Kind 0 profile as %s", self._npub)
+
+    async def _publish(self, builder) -> None:
+        """Sign a builder with the bot's key and broadcast it to the pool.
+
+        nostr-sdk >=0.45 removed Client.send_event_builder; the client has no
+        signer of its own, so events are finalized here before sending.
+        """
+        event = await builder.finalize_async(self._signer)
+        await self._client.send_event(event)
 
     async def _publish_relay_list(self) -> None:
         """Publish a Kind 10050 NIP-17 DM inbox list so senders know where to reach us."""
         tags = [Tag.parse(["relay", url]) for url in self._relay_urls]
-        await self._client.send_event_builder(
-            EventBuilder(Kind(10050), "").tags(tags)
-        )
+        await self._publish(EventBuilder(Kind(10050), "").tags(tags))
         logger.debug("Nostr: published Kind 10050 relay list (%d relays)", len(self._relay_urls))
 
     # ------------------------------------------------------------------
@@ -1078,19 +1170,33 @@ def _install_nostr_extra() -> bool:
     no wheel exists for the current Python/platform the install fails (Termux/
     Android is the main unsupported environment). Tries uv, then pip, then
     ensurepip→pip for uv-created venvs that lack pip.
+
+    The probe imports a 0.45-only symbol rather than just the package: this
+    adapter needs the 0.45 API, and an existing 0.44 install would otherwise be
+    left in place, silently flipping _NOSTR_SDK_AVAILABLE to False and
+    disabling the platform with no explanation.
     """
     from hermes_cli.cli_output import print_info, print_success, print_warning
+    upgrading = False
     try:
         __import__("nostr_sdk")
-        return True
     except ImportError:
         pass
-    print_info("Installing nostr-sdk (Nostr protocol library)...")
+    else:
+        try:
+            from nostr_sdk import ReqTarget  # noqa: F401  (0.45+ only)
+            return True
+        except ImportError:
+            upgrading = True
+    if upgrading:
+        print_info("Upgrading nostr-sdk to 0.45 (adds NIP-40 gift-wrap expiration)...")
+    else:
+        print_info("Installing nostr-sdk (Nostr protocol library)...")
     import sys as _sys
     import shutil as _shutil
     import subprocess
     import platform as _platform
-    pkg = "nostr-sdk>=0.44.2,<0.45"
+    pkg = "nostr-sdk>=0.45.0a7,<0.46"
     venv_root = Path(_sys.executable).parent.parent
     env = os.environ.copy()
     env["VIRTUAL_ENV"] = str(venv_root)
