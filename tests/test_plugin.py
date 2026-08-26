@@ -172,3 +172,130 @@ def test_env_enablement_returns_none_without_required():
         os.environ.pop("NOSTR_PRIVATE_KEY", None)
         os.environ.pop("NOSTR_RELAYS", None)
         assert _env_enablement() is None
+
+
+# --- watchdog hardening backport (stall detection + flapping escalation) ---
+
+def _adapter():
+    from hermes_nostr.adapter import NostrAdapter
+    with patch.dict(os.environ, {"NOSTR_ALLOWED_NPUBS": "a" * 64}, clear=False):
+        return NostrAdapter(_config())
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def test_handle_msg_refreshes_activity_heartbeat():
+    a = _adapter()
+    a._last_activity_monotonic = 0.0
+
+    async def go():
+        await a.handle_msg("wss://relay.example.com", None)
+        assert a._last_activity_monotonic > 0.0
+
+    _run(go())
+
+
+def test_is_loop_healthy_true_with_fresh_activity():
+    import time
+    a = _adapter()
+    a._watchdog_stall_seconds = 60.0
+    a._last_activity_monotonic = time.monotonic()  # fresh
+
+    class FakeRelay:
+        def status(self):
+            return a._CONNECTABLE_RELAY_STATUSES[0]
+
+    class FakeClient:
+        async def relays(self):
+            return {"r": FakeRelay()}
+
+    a._client = FakeClient()
+
+    async def go():
+        a._notif_task = asyncio.create_task(asyncio.sleep(30))
+        return await a._is_loop_healthy()
+
+    assert _run(go()) is True
+
+
+def test_is_loop_healthy_flags_stalled_silent_loop():
+    import time
+    a = _adapter()
+    a._watchdog_stall_seconds = 60.0
+    a._last_activity_monotonic = time.monotonic() - 120.0  # stale -> hung
+
+    class FakeRelay:
+        def status(self):
+            return a._CONNECTABLE_RELAY_STATUSES[0]
+
+    class FakeClient:
+        async def relays(self):
+            return {"r": FakeRelay()}
+
+    a._client = FakeClient()
+
+    async def go():
+        a._notif_task = asyncio.create_task(asyncio.sleep(30))
+        return await a._is_loop_healthy()
+
+    assert _run(go()) is False
+
+
+def test_attempt_recovery_escalates_to_full_rebuild_on_flap():
+    import time
+    a = _adapter()
+    a._running = True
+    a._watchdog_recovery_delays_initial = (0.0,)
+    a._watchdog_recovery_delay_steady = 0.0
+    a._consecutive_recoveries = 2
+    a._last_recovery_ts = time.monotonic()
+
+    calls = []
+
+    async def soft():
+        calls.append("soft")
+
+    async def full():
+        calls.append("full")
+
+    async def healthy():
+        return True
+
+    a._soft_reconnect_cycle = soft
+    a._full_reconnect_cycle = full
+    a._is_loop_healthy = healthy
+
+    _run(a._attempt_recovery())
+
+    assert calls == ["full"], f"expected escalation to full rebuild, got {calls}"
+
+
+def test_attempt_recovery_uses_soft_cycle_on_fresh_failure():
+    import time
+    a = _adapter()
+    a._running = True
+    a._watchdog_recovery_delays_initial = (0.0,)
+    a._watchdog_recovery_delay_steady = 0.0
+    a._consecutive_recoveries = 0
+    a._last_recovery_ts = 0.0
+
+    calls = []
+
+    async def soft():
+        calls.append("soft")
+
+    async def full():
+        calls.append("full")
+
+    async def healthy():
+        return True
+
+    a._soft_reconnect_cycle = soft
+    a._full_reconnect_cycle = full
+    a._is_loop_healthy = healthy
+
+    _run(a._attempt_recovery())
+
+    assert calls == ["soft"], f"expected soft cycle on fresh failure, got {calls}"
