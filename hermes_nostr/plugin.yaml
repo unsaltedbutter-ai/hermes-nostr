@@ -71,3 +71,11 @@ optional_env:
     description: "Relay replay window on connect/resubscribe (default 2880 = 48h, the NIP-59 minimum)."
     prompt: "Subscription lookback (minutes)"
     password: false
+  - name: NOSTR_WATCHDOG_STALL_MINUTES
+    description: "Watchdog: treat a connectable-but-silent notification loop as hung after this many minutes of zero relay activity (default 120)."
+    prompt: "Watchdog stall threshold (minutes)"
+    password: false
+  - name: NOSTR_WATCHDOG_ESCALATE_AFTER
+    description: "Watchdog: recoveries before escalating from a soft reconnect to a full client rebuild (default 3)."
+    prompt: "Rapid-recovery escalation threshold"
+    password: false

@@ -20,7 +20,11 @@ Hermes core**. It registers itself through Hermes's platform registry
   preserving code-fence boundaries, with `(1/N)` markers.
 - ⏲️ **NIP-40 expiration** + **NIP-59 timestamp obfuscation** on outbound DMs.
 - 🛟 **Self-healing relay watchdog** — supervises the notification loop and
-  reconnects with backoff, matching the other persistent-loop adapters.
+  reconnects with backoff, matching the other persistent-loop adapters. Detects
+  a **hung-but-connected** loop (stall of `NOSTR_WATCHDOG_STALL_MINUTES`, default
+  120, with zero relay activity) and **escalates** to a full client rebuild after
+  `NOSTR_WATCHDOG_ESCALATE_AFTER` (default 3) rapid recoveries, so a flapping or
+  stalled loop self-heals instead of going silently deaf.
 - ✅ **Allowlist, deny-by-default** — only npubs you list (or `*`) can talk to
   the bot. `npub` and hex forms are treated as the same identity.
 - 🗓️ **Cron / notification delivery** to your `NOSTR_HOME_CHANNEL`.

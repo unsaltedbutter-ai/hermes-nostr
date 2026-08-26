@@ -23,6 +23,11 @@ Optional env vars:
   NOSTR_EXPIRATION_MINUTES  NIP-40 TTL for outbound DMs (default: 10080 = 7 days)
   NOSTR_SEEN_MAX         Dedup cache size (default: 1000)
   NOSTR_LOOKBACK_MINUTES Subscription replay window (default: 2880 = 48h, NIP-59 minimum)
+  NOSTR_WATCHDOG_STALL_MINUTES  Watchdog stall threshold: treat a connectable-but-silent
+                                notification loop as hung after N min of zero relay
+                                activity (default: 120)
+  NOSTR_WATCHDOG_ESCALATE_AFTER Rapid-recovery count after which the watchdog escalates
+                                from a soft reconnect to a full client rebuild (default: 3)
 """
 
 import asyncio
@@ -117,6 +122,30 @@ WATCHDOG_RECOVERY_LOOKBACK_SECONDS = 600
 # Settle delay between disconnect() and connect() during a recovery cycle —
 # lets the Rust pool finish closing sockets before we ask it to open new ones.
 WATCHDOG_RECONNECT_SETTLE_SECONDS = 1.0
+
+# Stall detection.  The relay pool can keep reporting CONNECTED while the Rust
+# notification task has hung (socket open, frames queued, handler not being
+# pumped).  We stamp every message the handler is delivered — any kind, not
+# just events — and treat a connectable-but-silent loop as unhealthy once this
+# much time passes with zero delivery.  Set well past normal quiet periods:
+# public relays still emit EOSE/NOTICE/subscription frames, so 2h of total
+# silence while "connected" is a hang signal, not a busy lull.  Tune via
+# NOSTR_WATCHDOG_STALL_MINUTES (the recovery re-subscribes with a short
+# lookback, so an occasional idle-time recovery loses no messages).
+WATCHDOG_STALL_SECONDS: float = float(
+    os.getenv("NOSTR_WATCHDOG_STALL_MINUTES", "120")
+) * 60.0
+
+# Flapping escalation.  Recovery "succeeded" log lines that recur every tick
+# mean the soft reconnect is not sticking — the task keeps dying shortly after
+# restart.  After this many unhealthy observations that recur within
+# ESCALATE_WINDOW of a prior recovery, abandon the soft cycle for a full client
+# rebuild (fresh Client + fresh connect) instead of repeating a doomed soft one.
+WATCHDOG_ESCALATE_AFTER: int = int(os.getenv("NOSTR_WATCHDOG_ESCALATE_AFTER", "3"))
+WATCHDOG_ESCALATE_WINDOW_SECONDS: float = 300.0
+# Extra settle for a full rebuild (new Client object) so the previous pool's
+# sockets are fully released before the fresh one opens new tuples.
+WATCHDOG_FULL_RECONNECT_SETTLE_SECONDS: float = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +403,18 @@ class NostrAdapter(BasePlatformAdapter):
         self._watchdog_recovery_delay_steady: float = WATCHDOG_RECOVERY_DELAY_STEADY
         self._watchdog_reconnect_settle_seconds: float = WATCHDOG_RECONNECT_SETTLE_SECONDS
         self._watchdog_recovery_lookback_seconds: int = WATCHDOG_RECOVERY_LOOKBACK_SECONDS
+        self._watchdog_stall_seconds: float = WATCHDOG_STALL_SECONDS
+        self._watchdog_escalate_after: int = WATCHDOG_ESCALATE_AFTER
+        self._watchdog_escalate_window_seconds: float = WATCHDOG_ESCALATE_WINDOW_SECONDS
+        self._watchdog_full_reconnect_settle_seconds: float = WATCHDOG_FULL_RECONNECT_SETTLE_SECONDS
+        # Heartbeat: last time the handler was delivered ANY relay message.
+        # Seeded on loop (re)start so a brand-new loop is never instantly
+        # "stalled".  Reliability: a connected-but-hung loop stops pumping
+        # frames, so this goes stale even though the relay status reads CONNECTED.
+        self._last_activity_monotonic: float = time.monotonic()
+        # Flapping escalation bookkeeping (see WATCHDOG_ESCALATE_*).
+        self._consecutive_recoveries: int = 0
+        self._last_recovery_ts: float = 0.0
         self._running: bool = False
 
         logger.info(
@@ -490,6 +531,7 @@ class NostrAdapter(BasePlatformAdapter):
         await self._client.subscribe(ReqTarget.auto([f]))
 
         # Run the event handler loop
+        self._last_activity_monotonic = time.monotonic()
         self._notif_task = asyncio.create_task(
             self._notification_loop(notifications)
         )
@@ -570,6 +612,19 @@ class NostrAdapter(BasePlatformAdapter):
         for relay in relays.values():
             try:
                 if relay.status() in self._CONNECTABLE_RELAY_STATUSES:
+                    # The pool says the relay is up, but a hung handler stops
+                    # pumping frames even while the socket reads CONNECTED.  If
+                    # we've delivered NO message for the stall window, the loop
+                    # is wedged — report unhealthy so the watchdog recovers it.
+                    idle_for = time.monotonic() - self._last_activity_monotonic
+                    if idle_for > self._watchdog_stall_seconds:
+                        logger.warning(
+                            "Nostr watchdog: notification loop stalled — "
+                            "no relay activity for %.0f s (limit %.0f s)",
+                            idle_for,
+                            self._watchdog_stall_seconds,
+                        )
+                        return False
                     return True
             except Exception:
                 continue
@@ -618,17 +673,39 @@ class NostrAdapter(BasePlatformAdapter):
             raise
 
     async def _attempt_recovery(self) -> None:
-        """Soft-reconnect until healthy or disconnect() is called.
+        """Reconnect until healthy or disconnect() is called.
 
         Uses the initial fast-ramp delays for the first few attempts, then
         falls back to the steady-state cadence forever.  The cadence resets
         the next time the watchdog observes a transition from healthy →
         unhealthy (a fresh failure event), so each new outage gets the fast
         ramp; we don't punish a transient blip after a long uptime.
+
+        Escalation: if unhealthy recurs shortly after a prior recovery, the
+        soft cycle is not sticking (loop keeps dying -> flapping).  Past
+        WATCHDOG_ESCALATE_AFTER rapid recurrences we switch to a full client
+        rebuild instead of repeating a doomed soft cycle.
         """
         async with self._recovery_lock:
             initial = self._watchdog_recovery_delays_initial
             steady = self._watchdog_recovery_delay_steady
+
+            now = time.monotonic()
+            if now - self._last_recovery_ts <= self._watchdog_escalate_window_seconds:
+                self._consecutive_recoveries += 1
+            else:
+                self._consecutive_recoveries = 1
+            self._last_recovery_ts = now
+            escalate = self._consecutive_recoveries >= self._watchdog_escalate_after
+            if escalate:
+                logger.warning(
+                    "Nostr watchdog: %d rapid recoveries — escalating to full client rebuild",
+                    self._consecutive_recoveries,
+                )
+                cycle = self._full_reconnect_cycle
+            else:
+                cycle = self._soft_reconnect_cycle
+
             attempt = 0
             while self._running:
                 attempt += 1
@@ -644,7 +721,7 @@ class NostrAdapter(BasePlatformAdapter):
                 if not self._running:
                     return
                 try:
-                    await self._soft_reconnect_cycle()
+                    await cycle()
                 except asyncio.CancelledError:
                     return
                 except Exception:
@@ -658,6 +735,10 @@ class NostrAdapter(BasePlatformAdapter):
                             "Nostr watchdog: recovery succeeded on attempt %d",
                             attempt,
                         )
+                        # Held healthy — clear the escalation counter so a fresh
+                        # future outage starts from a clean slate.
+                        self._consecutive_recoveries = 0
+                        self._last_recovery_ts = 0.0
                         return
                 except Exception:
                     logger.exception(
@@ -714,6 +795,75 @@ class NostrAdapter(BasePlatformAdapter):
         self._notif_task = asyncio.create_task(
             self._notification_loop(notifications)
         )
+        self._last_activity_monotonic = time.monotonic()
+
+    async def _full_reconnect_cycle(self) -> None:
+        """Escalation path: tear down and rebuild the client from scratch.
+
+        Used when repeated soft cycles don't stick (loop keeps dying right
+        after restart — flapping).  A fresh ``Client`` plus fresh subscription
+        gives the Rust pool and relay state a clean slate instead of reusing a
+        possibly-corrupted client/socket pool that a soft cycle would keep
+        rebuilding over.
+        """
+        if self._notif_task and not self._notif_task.done():
+            self._notif_task.cancel()
+            try:
+                await self._notif_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._notif_task = None
+
+        if self._client:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+
+        # Extra settle so the old pool's sockets are fully released before the
+        # fresh Client opens new ones.
+        try:
+            await asyncio.sleep(self._watchdog_full_reconnect_settle_seconds)
+        except asyncio.CancelledError:
+            raise
+        if not self._running:
+            return
+
+        self._client = Client(self._signer)
+        added = 0
+        for url in self._relay_urls:
+            try:
+                await self._client.add_relay(RelayUrl.parse(url))
+                added += 1
+            except Exception as exc:
+                logger.warning("Nostr: could not re-add relay %s: %s", url, exc)
+        if added == 0:
+            logger.error(
+                "Nostr: full recovery re-added no relays — leaving client down"
+            )
+            self._client = None
+            return
+
+        await self._client.connect()
+        bot_pk = self._keys.public_key()
+        since_ts = Timestamp.from_secs(
+            max(0, int(time.time()) - self._watchdog_recovery_lookback_seconds)
+        )
+        f = (
+            Filter()
+            .pubkey(bot_pk)
+            .kind(Kind.from_std(KindStandard.GIFT_WRAP))
+            .since(since_ts)
+        )
+        # Open the notification stream BEFORE subscribing (notifications() only
+        # delivers what arrives after the call — subscribing first would race).
+        notifications = self._client.notifications()
+        await self._client.subscribe(ReqTarget.auto([f]))
+        self._last_activity_monotonic = time.monotonic()
+        self._notif_task = asyncio.create_task(
+            self._notification_loop(notifications)
+        )
 
     # ------------------------------------------------------------------
     # nostr-sdk notification stream
@@ -733,6 +883,11 @@ class NostrAdapter(BasePlatformAdapter):
                 if notification is None:
                     # Stream terminated (client shut down).
                     return
+                # Any item — a NEW_EVENT *or* a MESSAGE (EOSE/NOTICE/...) — proves
+                # the loop is still consuming frames, so refresh the activity
+                # heartbeat used by the stall watchdog.  A hung loop stops
+                # yielding items even while the socket reads CONNECTED.
+                self._last_activity_monotonic = time.monotonic()
                 if not isinstance(notification, ClientNotification.NEW_EVENT):
                     # MESSAGE (EOSE/NOTICE/...) and SHUTDOWN are not actioned.
                     continue
