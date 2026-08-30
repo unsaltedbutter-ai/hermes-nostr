@@ -1121,8 +1121,12 @@ class NostrAdapter(BasePlatformAdapter):
             meta_dict["website"] = self._bot_website
         metadata = Metadata.from_json(json.dumps(meta_dict, ensure_ascii=False))
         # nostr-sdk >=0.45 dropped Client.set_metadata and EventBuilder's kind
-        # constructors, so kind 0 is built and signed by hand.
-        await self._publish(EventBuilder(Kind(0), metadata.as_json()))
+        # constructors, so kind 0 is built and signed by hand. Metadata's
+        # into_event_builder() only exists in final 0.45, not in the 0.45a7
+        # alpha that ships first on wheels-only platforms — as_json() is in both.
+        await self._publish(
+            EventBuilder(Kind.from_std(KindStandard.METADATA), metadata.as_json())
+        )
         logger.debug("Nostr: published Kind 0 profile as %s", self._npub)
 
     async def _publish(self, builder) -> None:
