@@ -39,6 +39,11 @@ def _entry():
     return platform_registry.get("nostr")
 
 
+# Real bech32 npub (SdkKeys.generate()), not "a"*64: PublicKey.parse rejects
+# the latter, so home-channel / allowlist parsing would silently drop it.
+_TEST_PUBKEY = "npub17gdwes54ccy4f4ycgpmfjwxukmavsnt89mw2eg440y60xlzw3kuq9l4hun"
+
+
 def _config(token="a" * 64, relays="wss://relay.example.com", extra=None):
     from gateway.config import PlatformConfig
     e = {"relays": relays}
@@ -157,7 +162,7 @@ def test_env_enablement_seeds_relays_and_home():
         "NOSTR_PRIVATE_KEY": "a" * 64,
         "NOSTR_RELAYS": "wss://relay.example.com",
         "NOSTR_BOT_NAME": "TestBot",
-        "NOSTR_HOME_CHANNEL": "a" * 64,
+        "NOSTR_HOME_CHANNEL": _TEST_PUBKEY,
     }
     with patch.dict(os.environ, env, clear=False):
         seed = _env_enablement()
