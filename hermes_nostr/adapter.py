@@ -42,6 +42,11 @@ from typing import Any, ClassVar, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 try:
+    # Target release: nostr-sdk 0.45.x (>=0.45.0a7, <0.46). The bindings are
+    # uniffi-generated, so the import list doubles as a capability probe:
+    # 0.44 lacks ReqTarget / nip59_make_gift_wrap_async / Kind.from_std and
+    # its Client carries a signer, so the `Kind.from_std` import is what
+    # distinguishes the generations (checked in _install_nostr_extra too).
     from nostr_sdk import (
         Client,
         ClientNotification,
